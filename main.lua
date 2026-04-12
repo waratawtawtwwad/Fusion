@@ -94,9 +94,29 @@ local function HasUnfinished()
     local char = GetChar()
     if not char then return false end
     for _, item in pairs(char:GetChildren()) do
-        if Find(item.Name, {"unfin"}) then return true end
+        if Find(item.Name, {"unfin", "unfinished"}) then return true end
     end
     return false
+end
+
+local function GetUnfinishedFlintlocks()
+    local char = GetChar()
+    local unfinished = {}
+    if not char then return unfinished end
+    
+    for _, item in pairs(char:GetChildren()) do
+        if item:IsA("Tool") and Find(item.Name, {"unfin", "unfinished"}) and item:FindFirstChild("Handle") then
+            table.insert(unfinished, item)
+        end
+    end
+    
+    for _, item in pairs(LocalPlayer.Backpack:GetChildren()) do
+        if item:IsA("Tool") and Find(item.Name, {"unfin", "unfinished"}) and item:FindFirstChild("Handle") then
+            table.insert(unfinished, item)
+        end
+    end
+    
+    return unfinished
 end
 
 pcall(function()
@@ -116,8 +136,9 @@ pcall(function()
     end)
 end)
 
--- ========== F KEY - ATTACK ALL TOOLS AT ONCE (EXCLUDING BLACKLISTED) ==========
+-- ========== F KEY - EQUIP AND ATTACK ALL TOOLS (SAME AS BUTTON) ==========
 local isAttacking = false
+local equipAllConnections = {}
 
 local function GetAllTools()
     local char = GetChar()
@@ -137,7 +158,7 @@ local function GetAllTools()
     return tools
 end
 
-local function AttackAllToolsAtOnce()
+local function EquipAndAttackAllTools()
     if isAttacking then return end
     isAttacking = true
     
@@ -149,20 +170,37 @@ local function AttackAllToolsAtOnce()
     
     local tools = GetAllTools()
     if #tools == 0 then
+        Rayfield:Notify({ Title = "Equip All", Content = "No tools found.", Duration = 3, Image = "alert-circle" })
         isAttacking = false
         return
     end
     
+    -- Parent all tools to character
     for _, tool in ipairs(tools) do
         pcall(function()
-            if tool.Parent ~= char then
-                tool.Parent = char
-            end
+            tool.Parent = char
         end)
     end
     
     task.wait(0.05)
     
+    -- Clear old connections
+    for _, conn in ipairs(equipAllConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    equipAllConnections = {}
+    
+    -- Create connections to keep tools equipped
+    for _, tool in ipairs(tools) do
+        local conn = tool.AncestryChanged:Connect(function()
+            if tool.Parent == LocalPlayer.Backpack then
+                pcall(function() tool.Parent = char end)
+            end
+        end)
+        table.insert(equipAllConnections, conn)
+    end
+    
+    -- Attack with all tools simultaneously
     local threads = {}
     for _, tool in ipairs(tools) do
         table.insert(threads, task.spawn(function()
@@ -178,14 +216,17 @@ local function AttackAllToolsAtOnce()
         task.wait(0)
     end
     
+    Rayfield:Notify({ Title = "Equip All", Content = "All " .. #tools .. " tools equipped and attacking!", Duration = 3, Image = "zap" })
+    
     task.wait(0.1)
     isAttacking = false
 end
 
+-- Bind F key to equip and attack all tools
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
     if input.KeyCode == Enum.KeyCode.F then
-        AttackAllToolsAtOnce()
+        EquipAndAttackAllTools()
     end
 end)
 
@@ -382,33 +423,30 @@ Tab2:CreateButton({
     end
 })
 
--- IMPROVED WAVE CRAFTING SYSTEM - Touch each workbench with each tool sequentially
+-- WAVE CRAFTING SYSTEM - ONLY equips unfinished flintlocks
 Tab2:CreateButton({
     Name = "Craft (Wave System)",
     Callback = function()
-        local backpack = LocalPlayer.Backpack
         local char = GetChar()
         local hrp = GetHRP()
         if not char or not hrp then return end
         local origin = hrp.CFrame
 
-        -- Move unfinished items from backpack to character
-        for _, v in pairs(backpack:GetChildren()) do
-            if Find(v.Name, {"unfinished"}) then
+        -- ONLY move unfinished flintlocks from backpack to character
+        for _, v in pairs(LocalPlayer.Backpack:GetChildren()) do
+            if v:IsA("Tool") and Find(v.Name, {"unfin", "unfinished"}) then
                 v.Parent = char
             end
         end
 
-        for _, v in pairs(backpack:GetChildren()) do
-            if v:IsA("Tool") and Find(v.Name, {"flint", "shortsword"}) and not Find(v.Name, {"unfinished", "ammo"}) then
-                v.Parent = char
-            end
-        end
-
-        if not HasUnfinished() then
-            Rayfield:Notify({ Title = "Craft", Content = "No unfinished items found.", Duration = 3, Image = "alert-circle" })
+        -- Check if we have any unfinished flintlocks
+        local unfinishedItems = GetUnfinishedFlintlocks()
+        if #unfinishedItems == 0 then
+            Rayfield:Notify({ Title = "Craft", Content = "No unfinished flintlocks found.", Duration = 3, Image = "alert-circle" })
             return
         end
+
+        Rayfield:Notify({ Title = "Craft", Content = "Found " .. #unfinishedItems .. " unfinished flintlocks to craft.", Duration = 3, Image = "hammer" })
 
         -- Get all workbenches
         local _, partA = GetWorkbench("WorkbenchA")
@@ -432,7 +470,7 @@ Tab2:CreateButton({
         local maxAttempts = 30
         local giveUp = false
 
-        while HasUnfinished() and not giveUp do
+        while #GetUnfinishedFlintlocks() > 0 and not giveUp do
             craftCount += 1
             if craftCount > maxAttempts then
                 giveUp = true
@@ -443,17 +481,8 @@ Tab2:CreateButton({
 
             -- For each workbench
             for benchIndex, bench in ipairs(benches) do
-                if not HasUnfinished() then break end
-
-                -- Get current unfinished items
-                local unfinishedItems = {}
-                for _, item in pairs(char:GetChildren()) do
-                    if Find(item.Name, {"unfin"}) and item:FindFirstChild("Handle") then
-                        table.insert(unfinishedItems, item)
-                    end
-                end
-
-                if #unfinishedItems == 0 then break end
+                local currentUnfinished = GetUnfinishedFlintlocks()
+                if #currentUnfinished == 0 then break end
 
                 -- Teleport to the workbench
                 TeleportTo(CFrame.new(bench.Position) + Vector3.new(0, 3, 0))
@@ -461,51 +490,49 @@ Tab2:CreateButton({
 
                 Rayfield:Notify({ 
                     Title = "Wave System", 
-                    Content = "Using Workbench " .. benchIndex .. " with " .. #unfinishedItems .. " items", 
+                    Content = "Using Workbench " .. benchIndex .. " with " .. #currentUnfinished .. " flintlocks", 
                     Duration = 2, 
                     Image = "zap" 
                 })
 
-                -- Touch EACH tool to the workbench ONE BY ONE (slower wave)
-                for itemIndex, item in ipairs(unfinishedItems) do
-                    if not item.Parent then continue end
+                -- Touch EACH unfinished flintlock to the workbench ONE BY ONE
+                for itemIndex, item in ipairs(currentUnfinished) do
+                    if not item or not item.Parent then continue end
                     
                     pcall(function()
-                        -- Equip the tool
+                        -- ONLY equip the unfinished flintlock
                         char.Humanoid:EquipTool(item)
-                        task.wait(0.15) -- Slower delay for equipping
+                        task.wait(0.15)
                         
-                        -- Touch the workbench with the tool
+                        -- Touch the workbench with the flintlock
                         firetouchinterest(bench, item.Handle, 0)
                         task.wait(0.1)
                         firetouchinterest(bench, item.Handle, 1)
                         
-                        -- Visual feedback
                         Rayfield:Notify({ 
                             Title = "Crafting", 
-                            Content = "Item " .. itemIndex .. "/" .. #unfinishedItems .. " touched workbench " .. benchIndex, 
+                            Content = "Flintlock " .. itemIndex .. "/" .. #currentUnfinished .. " on bench " .. benchIndex, 
                             Duration = 1, 
                             Image = "hammer" 
                         })
                     end)
                     
-                    task.wait(0.2) -- Slower delay between tools
+                    task.wait(0.2)
                 end
                 
-                -- Small pause before moving to next workbench
                 task.wait(0.5)
             end
             
-            -- Pause between cycles
             task.wait(0.3)
         end
 
         TeleportTo(origin)
 
-        if giveUp then
-            Rayfield:Notify({ Title = "Craft", Content = "Max cycles reached — some items may not have crafted.", Duration = 5, Image = "alert-circle" })
+        local remaining = GetUnfinishedFlintlocks()
+        if #remaining > 0 then
+            Rayfield:Notify({ Title = "Craft", Content = #remaining .. " flintlocks remain uncrafted.", Duration = 5, Image = "alert-circle" })
         else
-            Rayfield:Notify({ Title = "Craft", Content = "All items crafted with wave system!", Duration = 3, Image = "hammer" })
+            Rayfield:Notify({ Title = "Craft", Content = "All unfinished flintlocks crafted!", Duration = 3, Image = "hammer" })
         end
     end
 })
@@ -537,13 +564,9 @@ Tab2:CreateButton({
             return
         end
 
+        -- Only move finished flintlocks to character for selling
         for _, v in pairs(LocalPlayer.Backpack:GetChildren()) do
-            if
-                v:IsA("Tool") and
-                Find(v.Name, {"flint", "shortsword"}) and
-                not Find(v.Name, {"unfinished"}) and
-                not Find(v.Name, {"ammo"})
-            then
+            if v:IsA("Tool") and Find(v.Name, {"flintlock", "flint", "shortsword"}) and not Find(v.Name, {"unfin", "unfinished", "ammo"}) then
                 v.Parent = char
             end
         end
@@ -552,13 +575,7 @@ Tab2:CreateButton({
         task.wait(0.3)
 
         for _, v in pairs(char:GetChildren()) do
-            if
-                v:IsA("Tool") and
-                Find(v.Name, {"flint", "shortsword"}) and
-                not Find(v.Name, {"unfinished"}) and
-                not Find(v.Name, {"ammo"}) and
-                v:FindFirstChild("Handle")
-            then
+            if v:IsA("Tool") and Find(v.Name, {"flintlock", "flint", "shortsword"}) and not Find(v.Name, {"unfin", "unfinished", "ammo"}) and v:FindFirstChild("Handle") then
                 pcall(function()
                     firetouchinterest(sellPart, v.Handle, 0)
                     task.wait(0.05)
@@ -871,8 +888,8 @@ Tab6:CreateSection("Info")
 Tab6:CreateParagraph({ Title = "Made by", Content = "Your Typical Exploiter" })
 Tab6:CreateParagraph({ Title = "Original idea", Content = "Dave" })
 Tab6:CreateParagraph({ Title = "Toggle UI", Content = "Press K to show/hide." })
-Tab6:CreateParagraph({ Title = "F Key Attack", Content = "Press F to attack with ALL tools at once (blacklisted tools excluded)!" })
-Tab6:CreateParagraph({ Title = "Wave Crafting", Content = "Each tool touches each workbench one by one in sequence!" })
+Tab6:CreateParagraph({ Title = "F Key Attack", Content = "Press F to EQUIP and ATTACK with ALL tools at once!" })
+Tab6:CreateParagraph({ Title = "Wave Crafting", Content = "Only equips unfinished flintlocks one by one!" })
 
 Tab6:CreateButton({
     Name = "Destroy GUI",
@@ -882,64 +899,15 @@ Tab6:CreateButton({
 })
 
 Tab6:CreateButton({
-    Name = "Equip All Tools",
+    Name = "Equip All Tools (Same as F Key)",
     Callback = function()
-        local char = GetChar()
-        if not char then return end
-
-        local toolsToEquip = {}
-        for _, tool in pairs(LocalPlayer.Backpack:GetChildren()) do
-            if tool:IsA("Tool") and not BLACKLISTED_TOOLS[tool.Name] then
-                table.insert(toolsToEquip, tool)
-            end
-        end
-        for _, tool in pairs(char:GetChildren()) do
-            if tool:IsA("Tool") and not BLACKLISTED_TOOLS[tool.Name] then
-                table.insert(toolsToEquip, tool)
-            end
-        end
-
-        if #toolsToEquip == 0 then
-            Rayfield:Notify({ Title = "Equip All", Content = "No tools found.", Duration = 3, Image = "alert-circle" })
-            return
-        end
-
-        for _, tool in ipairs(toolsToEquip) do
-            pcall(function()
-                tool.Parent = char
-            end)
-        end
-
-        task.wait(0.05)
-
-        getgenv().EquipAllConnections = getgenv().EquipAllConnections or {}
-        for _, conn in ipairs(getgenv().EquipAllConnections) do
-            pcall(function() conn:Disconnect() end)
-        end
-        getgenv().EquipAllConnections = {}
-
-        for _, tool in ipairs(toolsToEquip) do
-            local conn = tool.AncestryChanged:Connect(function()
-                if tool.Parent == LocalPlayer.Backpack then
-                    pcall(function() tool.Parent = char end)
-                end
-            end)
-            table.insert(getgenv().EquipAllConnections, conn)
-        end
-
-        for _, tool in ipairs(toolsToEquip) do
-            task.spawn(function()
-                pcall(function() tool:Activate() end)
-            end)
-        end
-
-        Rayfield:Notify({ Title = "Equip All", Content = "All " .. #toolsToEquip .. " tools equipped and locked in.", Duration = 3, Image = "zap" })
+        EquipAndAttackAllTools()
     end
 })
 
 Rayfield:Notify({
     Title = "Fusion (Hub)",
-    Content = "Loaded! Press F to attack with ALL tools! Wave crafting system active!",
+    Content = "Loaded! Press F to equip and attack with ALL tools at once!",
     Duration = 5,
     Image = "check-circle",
 })
