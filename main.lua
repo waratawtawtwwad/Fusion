@@ -360,8 +360,10 @@ local function MoveMouseRel(deltaX, deltaY)
     end
 end
 
+local aimbotEnabledFlag = false
+
 local function Aimbot()
-    if not aimbotEnabled then return end
+    if not aimbotEnabledFlag then return end
     local target = GetClosestPlayer()
     if not target then return end
     local character = target.Character
@@ -376,14 +378,14 @@ local function Aimbot()
 end
 
 local function EnableAimbot()
-    aimbotEnabled = true
+    aimbotEnabledFlag = true
     if aimbotConnection then aimbotConnection:Disconnect() end
     aimbotConnection = RunService.RenderStepped:Connect(Aimbot)
     Rayfield:Notify({ Title = "Aimbot", Content = "Enabled! Press X to disable.", Duration = 3, Image = "target" })
 end
 
 local function DisableAimbot()
-    aimbotEnabled = false
+    aimbotEnabledFlag = false
     if aimbotConnection then aimbotConnection:Disconnect() aimbotConnection = nil end
     Rayfield:Notify({ Title = "Aimbot", Content = "Disabled.", Duration = 2, Image = "shield" })
 end
@@ -391,13 +393,21 @@ end
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
     if input.KeyCode == Enum.KeyCode.X then
-        if aimbotEnabled then DisableAimbot() else EnableAimbot() end
+        if aimbotEnabledFlag then DisableAimbot() else EnableAimbot() end
     end
 end)
 
 -- =====================
 --      KILL AURA
 -- =====================
+
+local function GetCurrentTool()
+    local char = GetChar()
+    if not char then return nil end
+    local humanoid = char:FindFirstChild("Humanoid")
+    if not humanoid then return nil end
+    return humanoid:FindFirstChild("ActiveTool")
+end
 
 local function GetAllToolsForAttack()
     local char = GetChar()
@@ -436,7 +446,7 @@ local function GetNearestPlayer()
     return nearest
 end
 
-local function AttackTarget(targetPlayer)
+local function AttackWithCurrentWeapon(targetPlayer)
     if not targetPlayer then return false end
     local character = targetPlayer.Character
     if not character then return false end
@@ -446,34 +456,52 @@ local function AttackTarget(targetPlayer)
     if not head then return false end
     local hrp = GetHRP()
     if not hrp then return false end
+    
+    -- Get the currently equipped tool
+    local currentTool = GetCurrentTool()
+    if not currentTool then return false end
+    
+    -- Store original position
     local origin = hrp.CFrame
+    
+    -- Teleport to target
     TeleportTo(CFrame.new(head.Position) + Vector3.new(0, 2, 0))
     task.wait(0.05)
-    local tools = GetAllToolsForAttack()
-    for _, tool in ipairs(tools) do
-        pcall(function()
-            local char = GetChar()
-            if char then
-                char.Humanoid:EquipTool(tool)
-                task.wait(0.01)
-                tool:Activate()
-            end
-        end)
-        task.wait(0.03)
-    end
+    
+    -- Attack with current weapon only
+    pcall(function()
+        if currentTool and currentTool.Parent == GetChar() then
+            currentTool:Activate()
+        end
+    end)
+    
+    task.wait(0.05)
     TeleportTo(origin)
     return humanoid.Health > 0
 end
 
 local function KillAura()
     if not killauraEnabled then return end
+    
+    -- Check if current target is still valid
     if currentTarget then
         local character = currentTarget.Character
         local humanoid = character and character:FindFirstChild("Humanoid")
-        if not character or not humanoid or humanoid.Health <= 0 then currentTarget = nil end
+        if not character or not humanoid or humanoid.Health <= 0 then 
+            currentTarget = nil 
+        end
     end
-    if not currentTarget then currentTarget = GetNearestPlayer() end
-    if currentTarget then AttackTarget(currentTarget) task.wait(0.1) end
+    
+    -- Find new target if needed
+    if not currentTarget then 
+        currentTarget = GetNearestPlayer() 
+    end
+    
+    -- Attack with current weapon if we have a target
+    if currentTarget then 
+        AttackWithCurrentWeapon(currentTarget) 
+        task.wait(0.1) 
+    end
 end
 
 local function EnableKillAura()
@@ -481,7 +509,7 @@ local function EnableKillAura()
     currentTarget = nil
     if killauraConnection then killauraConnection:Disconnect() end
     killauraConnection = RunService.RenderStepped:Connect(KillAura)
-    Rayfield:Notify({ Title = "Kill Aura", Content = "Enabled! Targeting nearest player until death!", Duration = 3, Image = "sword" })
+    Rayfield:Notify({ Title = "Kill Aura", Content = "Enabled! Will use your currently held weapon!", Duration = 3, Image = "sword" })
 end
 
 local function DisableKillAura()
@@ -590,7 +618,7 @@ Tab1:CreateToggle({
 })
 
 Tab1:CreateToggle({
-    Name = "Kill Aura (Target until death)",
+    Name = "Kill Aura (Uses current weapon)",
     CurrentValue = false,
     Flag = "KillAuraToggle",
     Callback = function(Value)
@@ -1202,7 +1230,7 @@ Tab6:CreateParagraph({ Title = "Original idea",   Content = "Dave" })
 Tab6:CreateParagraph({ Title = "Toggle UI",       Content = "Press K to show/hide." })
 Tab6:CreateParagraph({ Title = "F Key (Grenades)", Content = "Press F to equip and throw ALL grenades/bombs at once!" })
 Tab6:CreateParagraph({ Title = "X Key Aimbot",    Content = "Press X to toggle aimbot on/off!" })
-Tab6:CreateParagraph({ Title = "Kill Aura",       Content = "Targets nearest player until death!" })
+Tab6:CreateParagraph({ Title = "Kill Aura",       Content = "Uses your currently equipped weapon! Targets nearest player until death!" })
 Tab6:CreateParagraph({ Title = "Hitbox Extender", Content = "Expands player hitboxes up to size 100. Resets on disable." })
 
 Tab6:CreateButton({
@@ -1224,7 +1252,7 @@ Tab6:CreateButton({
 
 Rayfield:Notify({
     Title = "Fusion (Hub)",
-    Content = "Loaded! F = grenades | X = aimbot | Hitbox up to size 100",
+    Content = "Loaded! F = grenades | X = aimbot | Kill Aura uses current weapon",
     Duration = 5,
     Image = "check-circle",
 })
