@@ -10,9 +10,9 @@ local Window = Rayfield:CreateWindow({
     DisableRayfieldPrompts = false,
     DisableBuildWarnings = false,
     ConfigurationSaving = {
-        Enabled = false,
-        FolderName = nil,
-        FileName = "FusionHub"
+        Enabled = true,
+        FolderName = "FusionHub",
+        FileName = "Settings"
     },
     Discord = {
         Enabled = false,
@@ -22,20 +22,41 @@ local Window = Rayfield:CreateWindow({
     KeySystem = false
 })
 
-local Players      = game:GetService("Players")
-local Workspace    = game:GetService("Workspace")
-local TweenService = game:GetService("TweenService")
+local Players          = game:GetService("Players")
+local Workspace        = game:GetService("Workspace")
+local TweenService     = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
-local LocalPlayer  = Players.LocalPlayer
+local RunService       = game:GetService("RunService")
+local LocalPlayer      = Players.LocalPlayer
 
--- BLACKLISTED TOOLS (won't be used in F key attack)
+-- =====================
+--        STATE
+-- =====================
+
+local hitboxExtenderEnabled     = false
+local aimbotEnabled             = false
+local killauraEnabled           = false
+local hitboxSize                = 15
+local aimbotRange               = 100
+local hitboxExtenderConnections = {}
+local aimbotConnection          = nil
+local killauraConnection        = nil
+local currentTarget             = nil
+local originalSizes             = {}
+local isAttacking               = false
+local equipAllConnections       = {}
+
 local BLACKLISTED_TOOLS = {
     ["Equip to Click TP"] = true,
-    ["doctor's bag"] = true,
-    ["leech"] = true,
-    ["Broom"] = true,
-    ["Excalibur"] = false,
+    ["doctor's bag"]      = true,
+    ["leech"]             = true,
+    ["Broom"]             = true,
+    ["Excalibur"]         = false,
 }
+
+-- =====================
+--       HELPERS
+-- =====================
 
 local function GetChar()
     return LocalPlayer.Character
@@ -90,44 +111,37 @@ local function SafeGet(fn)
     return ok and result or nil
 end
 
-local function HasUnfinished()
-    local char = GetChar()
-    if not char then return false end
-    for _, item in pairs(char:GetChildren()) do
-        if Find(item.Name, {"unfin", "unfinished"}) then return true end
-    end
-    return false
-end
-
 local function GetUnfinishedFlintlocks()
     local char = GetChar()
     local unfinished = {}
     if not char then return unfinished end
-    
     for _, item in pairs(char:GetChildren()) do
         if item:IsA("Tool") and Find(item.Name, {"unfin", "unfinished"}) and item:FindFirstChild("Handle") then
             table.insert(unfinished, item)
         end
     end
-    
     for _, item in pairs(LocalPlayer.Backpack:GetChildren()) do
         if item:IsA("Tool") and Find(item.Name, {"unfin", "unfinished"}) and item:FindFirstChild("Handle") then
             table.insert(unfinished, item)
         end
     end
-    
     return unfinished
 end
 
+-- Anticheat cleanup
 pcall(function()
     local char = GetChar()
-    for _, v in pairs(char:GetChildren()) do
-        if v.Name == "anticheatcooldown" then v:Destroy() end
+    if char then
+        for _, v in pairs(char:GetChildren()) do
+            if v.Name == "anticheatcooldown" then v:Destroy() end
+        end
+        if char:FindFirstChild("Humanoid") then
+            char.Humanoid.Died:Connect(function()
+                local tbp = char:FindFirstChild("anticheatcooldown")
+                if tbp then tbp:Destroy() end
+            end)
+        end
     end
-    char.Humanoid.Died:Connect(function()
-        local tbp = char:WaitForChild("anticheatcooldown", 5)
-        if tbp then tbp:Destroy() end
-    end)
 end)
 
 pcall(function()
@@ -136,9 +150,386 @@ pcall(function()
     end)
 end)
 
--- ========== F KEY - EQUIP AND ATTACK ALL TOOLS (SAME AS BUTTON) ==========
-local isAttacking = false
-local equipAllConnections = {}
+-- =====================
+--    HITBOX EXTENDER
+-- Saves true original sizes once per character load (never overwrites
+-- them on resize), handles both R6 and R15, cleans up on character
+-- removal, and re-expands live when the slider moves.
+-- =====================
+
+-- Returns the parts we actually care about expanding for a character.
+-- Skips accessories, tools, and anything that isn't a core body part
+-- so we don't break clothing/hat mesh sizes.
+local CORE_PARTS = {
+    HumanoidRootPart = true,
+    Head             = true,
+    -- R15
+    UpperTorso       = true,
+    LowerTorso       = true,
+    LeftUpperArm     = true, LeftLowerArm  = true, LeftHand      = true,
+    RightUpperArm    = true, RightLowerArm = true, RightHand     = true,
+    LeftUpperLeg     = true, LeftLowerLeg  = true, LeftFoot      = true,
+    RightUpperLeg    = true, RightLowerLeg = true, RightFoot     = true,
+    -- R6
+    Torso            = true,
+    ["Left Arm"]     = true, ["Right Arm"]  = true,
+    ["Left Leg"]     = true, ["Right Leg"]  = true,
+}
+
+local function GetCoreParts(character)
+    local parts = {}
+    for _, v in pairs(character:GetChildren()) do
+        if v:IsA("BasePart") and CORE_PARTS[v.Name] then
+            table.insert(parts, v)
+        end
+    end
+    return parts
+end
+
+-- Save true originals — only called once per fresh character, never again.
+local function SaveOriginalSizes(player, character)
+    if originalSizes[player] then return end -- already saved, don't overwrite
+    originalSizes[player] = {}
+    for _, part in pairs(GetCoreParts(character)) do
+        originalSizes[player][part] = part.Size
+    end
+end
+
+-- Apply hitbox expansion using the current hitboxSize.
+-- Safe to call multiple times (e.g. when slider changes).
+local function ApplyHitbox(character)
+    if not character then return end
+    local player = Players:GetPlayerFromCharacter(character)
+    if not player or player == LocalPlayer then return end
+    if not originalSizes[player] then return end -- originals not saved yet, bail
+
+    for _, part in pairs(GetCoreParts(character)) do
+        pcall(function()
+            if part.Name == "HumanoidRootPart" then
+                part.Size = Vector3.new(hitboxSize, hitboxSize, hitboxSize)
+            elseif part.Name == "Head" then
+                part.Size = Vector3.new(hitboxSize, hitboxSize, hitboxSize)
+            else
+                -- All body parts get full size so any swing registers
+                part.Size = Vector3.new(hitboxSize, hitboxSize, hitboxSize)
+            end
+        end)
+    end
+end
+
+-- Restore exact originals and wipe the saved table entry.
+local function ResetPlayerHitbox(player)
+    if not originalSizes[player] then return end
+    for part, originalSize in pairs(originalSizes[player]) do
+        pcall(function()
+            if part and part.Parent then
+                part.Size = originalSize
+            end
+        end)
+    end
+    originalSizes[player] = nil
+end
+
+-- Full setup for one player: save originals then expand.
+local function SetupPlayer(player)
+    if player == LocalPlayer then return end
+    local character = player.Character
+    if not character then return end
+    -- Wait for character to fully load if needed
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+    SaveOriginalSizes(player, character)
+    if hitboxExtenderEnabled then
+        ApplyHitbox(character)
+    end
+end
+
+local function EnableHitboxExtender()
+    if hitboxExtenderEnabled then return end
+    hitboxExtenderEnabled = true
+
+    -- Apply to everyone already in the server
+    for _, player in pairs(Players:GetPlayers()) do
+        SetupPlayer(player)
+    end
+
+    -- Hook future character spawns for existing players
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local conn = player.CharacterAdded:Connect(function(character)
+                -- Wait for physics to settle and parts to replicate
+                task.wait(0.75)
+                if not hitboxExtenderEnabled then return end
+                originalSizes[player] = nil -- fresh character, clear stale data
+                SaveOriginalSizes(player, character)
+                ApplyHitbox(character)
+            end)
+            if not hitboxExtenderConnections[player] then
+                hitboxExtenderConnections[player] = {}
+            end
+            table.insert(hitboxExtenderConnections[player], conn)
+
+            -- Also reset originals when character is removed (they respawn fresh)
+            local remConn = player.CharacterRemoving:Connect(function()
+                originalSizes[player] = nil
+            end)
+            table.insert(hitboxExtenderConnections[player], remConn)
+        end
+    end
+
+    -- Hook players who join mid-session
+    local playerAddedConn = Players.PlayerAdded:Connect(function(player)
+        if player == LocalPlayer then return end
+        -- Hook their character spawns
+        local conn = player.CharacterAdded:Connect(function(character)
+            task.wait(0.75)
+            if not hitboxExtenderEnabled then return end
+            originalSizes[player] = nil
+            SaveOriginalSizes(player, character)
+            ApplyHitbox(character)
+        end)
+        local remConn = player.CharacterRemoving:Connect(function()
+            originalSizes[player] = nil
+        end)
+        if not hitboxExtenderConnections[player] then
+            hitboxExtenderConnections[player] = {}
+        end
+        table.insert(hitboxExtenderConnections[player], conn)
+        table.insert(hitboxExtenderConnections[player], remConn)
+        -- They might already have a character
+        task.wait(0.75)
+        SetupPlayer(player)
+    end)
+    table.insert(hitboxExtenderConnections, playerAddedConn)
+end
+
+local function DisableHitboxExtender()
+    if not hitboxExtenderEnabled then return end
+    hitboxExtenderEnabled = false
+
+    -- Reset all players back to true originals
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            ResetPlayerHitbox(player)
+        end
+    end
+
+    -- Disconnect everything
+    for _, conn in pairs(hitboxExtenderConnections) do
+        if type(conn) == "table" then
+            for _, subConn in pairs(conn) do
+                pcall(function() subConn:Disconnect() end)
+            end
+        else
+            pcall(function() conn:Disconnect() end)
+        end
+    end
+    hitboxExtenderConnections = {}
+end
+
+-- Called by the slider — re-applies current size to all live characters
+-- without touching originalSizes (originals are never overwritten).
+local function RefreshAllHitboxes()
+    if not hitboxExtenderEnabled then return end
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            ApplyHitbox(player.Character)
+        end
+    end
+end
+
+-- =====================
+-- AIMBOT (Doc 1)
+-- Uses mousemoverel for relative mouse delta to snap onto target
+-- =====================
+
+local function GetClosestPlayer()
+    local hrp = GetHRP()
+    if not hrp then return nil end
+    local closestPlayer = nil
+    local closestDistance = aimbotRange
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local character = player.Character
+            if character and character:FindFirstChild("Humanoid") and character.Humanoid.Health > 0 then
+                local targetHRP = character:FindFirstChild("HumanoidRootPart")
+                if targetHRP then
+                    local distance = (hrp.Position - targetHRP.Position).Magnitude
+                    if distance < closestDistance then
+                        closestDistance = distance
+                        closestPlayer = player
+                    end
+                end
+            end
+        end
+    end
+    return closestPlayer
+end
+
+-- mousemoverel wrapper — tries the executor global first, falls back to VirtualInputGame
+local function MoveMouseRel(deltaX, deltaY)
+    if mousemoverel then
+        pcall(mousemoverel, deltaX, deltaY)
+    else
+        pcall(function()
+            local VirtualInput = game:GetService("VirtualInputGame")
+            local mouse = LocalPlayer:GetMouse()
+            local newPos = Vector2.new(mouse.X + deltaX, mouse.Y + deltaY)
+            VirtualInput:SendMouseMoveEvent(newPos)
+        end)
+    end
+end
+
+local function Aimbot()
+    if not aimbotEnabled then return end
+    local target = GetClosestPlayer()
+    if not target then return end
+    local character = target.Character
+    if not character then return end
+    local targetHRP = character:FindFirstChild("HumanoidRootPart")
+    if not targetHRP then return end
+    local mouse = LocalPlayer:GetMouse()
+    local targetPos, onScreen = workspace.CurrentCamera:WorldToViewportPoint(targetHRP.Position)
+    if onScreen then
+        MoveMouseRel(targetPos.X - mouse.X, targetPos.Y - mouse.Y)
+    end
+end
+
+local function EnableAimbot()
+    aimbotEnabled = true
+    if aimbotConnection then aimbotConnection:Disconnect() end
+    aimbotConnection = RunService.RenderStepped:Connect(Aimbot)
+    Rayfield:Notify({ Title = "Aimbot", Content = "Enabled! Press X to disable.", Duration = 3, Image = "target" })
+end
+
+local function DisableAimbot()
+    aimbotEnabled = false
+    if aimbotConnection then
+        aimbotConnection:Disconnect()
+        aimbotConnection = nil
+    end
+    Rayfield:Notify({ Title = "Aimbot", Content = "Disabled.", Duration = 2, Image = "shield" })
+end
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == Enum.KeyCode.X then
+        if aimbotEnabled then DisableAimbot() else EnableAimbot() end
+    end
+end)
+
+-- =====================
+--      KILL AURA
+-- =====================
+
+local function GetAllToolsForAttack()
+    local char = GetChar()
+    local tools = {}
+    if char then
+        for _, child in pairs(char:GetChildren()) do
+            if child:IsA("Tool") and child:FindFirstChild("Handle") and not BLACKLISTED_TOOLS[child.Name] then
+                table.insert(tools, child)
+            end
+        end
+    end
+    for _, child in pairs(LocalPlayer.Backpack:GetChildren()) do
+        if child:IsA("Tool") and child:FindFirstChild("Handle") and not BLACKLISTED_TOOLS[child.Name] then
+            table.insert(tools, child)
+        end
+    end
+    return tools
+end
+
+local function GetNearestPlayer()
+    local hrp = GetHRP()
+    if not hrp then return nil end
+    local nearest, nearestDist = nil, math.huge
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local character = player.Character
+            if character and character:FindFirstChild("Humanoid") and character.Humanoid.Health > 0 then
+                local targetHRP = character:FindFirstChild("HumanoidRootPart")
+                if targetHRP then
+                    local dist = (hrp.Position - targetHRP.Position).Magnitude
+                    if dist < nearestDist then
+                        nearestDist = dist
+                        nearest = player
+                    end
+                end
+            end
+        end
+    end
+    return nearest
+end
+
+local function AttackTarget(targetPlayer)
+    if not targetPlayer then return false end
+    local character = targetPlayer.Character
+    if not character then return false end
+    local humanoid = character:FindFirstChild("Humanoid")
+    if not humanoid or humanoid.Health <= 0 then return false end
+    local head = character:FindFirstChild("Head") or character:FindFirstChild("HumanoidRootPart")
+    if not head then return false end
+    local hrp = GetHRP()
+    if not hrp then return false end
+    local origin = hrp.CFrame
+    TeleportTo(CFrame.new(head.Position) + Vector3.new(0, 2, 0))
+    task.wait(0.05)
+    local tools = GetAllToolsForAttack()
+    for _, tool in ipairs(tools) do
+        pcall(function()
+            local char = GetChar()
+            if char then
+                char.Humanoid:EquipTool(tool)
+                task.wait(0.01)
+                tool:Activate()
+            end
+        end)
+        task.wait(0.03)
+    end
+    TeleportTo(origin)
+    return humanoid.Health > 0
+end
+
+local function KillAura()
+    if not killauraEnabled then return end
+    if currentTarget then
+        local character = currentTarget.Character
+        local humanoid = character and character:FindFirstChild("Humanoid")
+        if not character or not humanoid or humanoid.Health <= 0 then
+            currentTarget = nil
+        end
+    end
+    if not currentTarget then
+        currentTarget = GetNearestPlayer()
+    end
+    if currentTarget then
+        AttackTarget(currentTarget)
+        task.wait(0.1)
+    end
+end
+
+local function EnableKillAura()
+    killauraEnabled = true
+    currentTarget = nil
+    if killauraConnection then killauraConnection:Disconnect() end
+    killauraConnection = RunService.RenderStepped:Connect(KillAura)
+    Rayfield:Notify({ Title = "Kill Aura", Content = "Enabled! Targeting nearest player until death!", Duration = 3, Image = "sword" })
+end
+
+local function DisableKillAura()
+    killauraEnabled = false
+    currentTarget = nil
+    if killauraConnection then
+        killauraConnection:Disconnect()
+        killauraConnection = nil
+    end
+    Rayfield:Notify({ Title = "Kill Aura", Content = "Disabled.", Duration = 2, Image = "shield" })
+end
+
+-- =====================
+--    F KEY — ALL TOOLS
+-- =====================
 
 local function GetAllTools()
     local char = GetChar()
@@ -161,36 +552,22 @@ end
 local function EquipAndAttackAllTools()
     if isAttacking then return end
     isAttacking = true
-    
     local char = GetChar()
-    if not char then 
-        isAttacking = false
-        return 
-    end
-    
+    if not char then isAttacking = false return end
     local tools = GetAllTools()
     if #tools == 0 then
         Rayfield:Notify({ Title = "Equip All", Content = "No tools found.", Duration = 3, Image = "alert-circle" })
         isAttacking = false
         return
     end
-    
-    -- Parent all tools to character
     for _, tool in ipairs(tools) do
-        pcall(function()
-            tool.Parent = char
-        end)
+        pcall(function() tool.Parent = char end)
     end
-    
     task.wait(0.05)
-    
-    -- Clear old connections
     for _, conn in ipairs(equipAllConnections) do
         pcall(function() conn:Disconnect() end)
     end
     equipAllConnections = {}
-    
-    -- Create connections to keep tools equipped
     for _, tool in ipairs(tools) do
         local conn = tool.AncestryChanged:Connect(function()
             if tool.Parent == LocalPlayer.Backpack then
@@ -199,30 +576,20 @@ local function EquipAndAttackAllTools()
         end)
         table.insert(equipAllConnections, conn)
     end
-    
-    -- Attack with all tools simultaneously
-    local threads = {}
     for _, tool in ipairs(tools) do
-        table.insert(threads, task.spawn(function()
+        task.spawn(function()
             pcall(function()
                 char.Humanoid:EquipTool(tool)
                 task.wait(0.01)
                 tool:Activate()
             end)
-        end))
+        end)
     end
-    
-    for _, thread in ipairs(threads) do
-        task.wait(0)
-    end
-    
-    Rayfield:Notify({ Title = "Equip All", Content = "All " .. #tools .. " tools equipped and attacking!", Duration = 3, Image = "zap" })
-    
+    Rayfield:Notify({ Title = "Equip All", Content = "All " .. #tools .. " tools equipped and attacking!", Duration = 2, Image = "zap" })
     task.wait(0.1)
     isAttacking = false
 end
 
--- Bind F key to equip and attack all tools
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
     if input.KeyCode == Enum.KeyCode.F then
@@ -230,18 +597,83 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
     end
 end)
 
+-- =====================
+--       UI — MAIN TAB
+-- =====================
+
 local Tab1 = Window:CreateTab("Main", "map-pin")
+
+Tab1:CreateSection("Combat")
+
+Tab1:CreateToggle({
+    Name = "Aimbot (Press X to toggle)",
+    CurrentValue = false,
+    Flag = "AimbotToggle",
+    Callback = function(Value)
+        if Value then EnableAimbot() else DisableAimbot() end
+    end
+})
+
+Tab1:CreateToggle({
+    Name = "Kill Aura (Target until death)",
+    CurrentValue = false,
+    Flag = "KillAuraToggle",
+    Callback = function(Value)
+        if Value then EnableKillAura() else DisableKillAura() end
+    end
+})
+
+Tab1:CreateToggle({
+    Name = "Hitbox Extender",
+    CurrentValue = false,
+    Flag = "HitboxToggle",
+    Callback = function(Value)
+        if Value then
+            EnableHitboxExtender()
+            Rayfield:Notify({ Title = "Hitbox Extender", Content = "Enabled! Size: " .. hitboxSize, Duration = 3, Image = "target" })
+        else
+            DisableHitboxExtender()
+            Rayfield:Notify({ Title = "Hitbox Extender", Content = "Disabled.", Duration = 2, Image = "shield" })
+        end
+    end
+})
+
+Tab1:CreateSlider({
+    Name = "Hitbox Size (5-100)",
+    Range = {5, 100},
+    Increment = 1,
+    CurrentValue = 15,
+    Flag = "HitboxSize",
+    Callback = function(Value)
+        hitboxSize = Value
+        RefreshAllHitboxes()
+        if hitboxExtenderEnabled then
+            Rayfield:Notify({ Title = "Hitbox Size", Content = "Updated to " .. hitboxSize, Duration = 1, Image = "square" })
+        end
+    end
+})
+
+Tab1:CreateSlider({
+    Name = "Aimbot Range",
+    Range = {50, 500},
+    Increment = 10,
+    CurrentValue = 100,
+    Flag = "AimbotRange",
+    Callback = function(Value)
+        aimbotRange = Value
+    end
+})
 
 Tab1:CreateSection("Teleport")
 
 local DESTINATIONS = {
-    ["Bank"]        = CFrame.new(-563.517029, 13.6589241, -113.084167, 0, 0, 1, 0, 1, 0, -1, 0, 0),
-    ["Museum"]      = CFrame.new(-44.517025,  13.6589012, -83.5842743, 0, 0, 1, 0, 1, 0, -1, 0, 0),
-    ["Apothecary"]  = CFrame.new(-662.517029, 13.6589241, -270.584198, -1, 0, 0, 0, 1, 0, 0, 0, -1),
-    ["Itemstore"]   = CFrame.new(-403.517059, 13.6589241, -0.084186554, 1, 0, 0, 0, 1, 0, 0, 0, 1),
-    ["Armoury"]     = CFrame.new(-420.017029, 13.6588936, -250.084198, 0, 0, 1, 0, 1, 0, -1, 0, 0),
-    ["Dresser"]     = CFrame.new(-983.516785, 13.1588478, -19.0836525, 0, 0, -1, 0, 1, 0, 1, 0, 0),
-    ["Blackmarket"] = CFrame.new(-1042.01709, 13.1587105, -223.083252, 0, 0, 1, 0, 1, 0, -1, 0, 0),
+    ["Bank"]        = CFrame.new(-563.517029, 13.6589241, -113.084167),
+    ["Museum"]      = CFrame.new(-44.517025,  13.6589012,  -83.5842743),
+    ["Apothecary"]  = CFrame.new(-662.517029, 13.6589241, -270.584198),
+    ["Itemstore"]   = CFrame.new(-403.517059, 13.6589241,   -0.084186554),
+    ["Armoury"]     = CFrame.new(-420.017029, 13.6588936, -250.084198),
+    ["Dresser"]     = CFrame.new(-983.516785, 13.1588478,  -19.0836525),
+    ["Blackmarket"] = CFrame.new(-1042.01709, 13.1587105, -223.083252),
     ["Secret"]      = CFrame.new(-187, 198, 225),
 }
 
@@ -291,18 +723,14 @@ Tab1:CreateToggle({
     Flag = "MoneybagToggle",
     Callback = function(Value)
         getgenv().Moneybags = Value
-
         if Value then
             for _, v in pairs(Workspace:GetChildren()) do
                 if v.Name == "moneybag" then
                     local part = v:IsA("BasePart") and v or v:FindFirstChildWhichIsA("BasePart")
-                    if part and part.Anchored then
-                        v:Destroy()
-                    end
+                    if part and part.Anchored then v:Destroy() end
                 end
             end
         end
-
         while getgenv().Moneybags do
             task.wait(0.05)
             local hrp = GetHRP()
@@ -321,9 +749,7 @@ Tab1:CreateToggle({
                         end
                     end
                 end
-                if collected and getgenv().Moneybags then
-                    TeleportTo(origin)
-                end
+                if collected and getgenv().Moneybags then TeleportTo(origin) end
             end
         end
     end
@@ -342,12 +768,7 @@ Tab1:CreateToggle({
             if char and hrp then
                 local origin = hrp.CFrame
                 for _, v in pairs(Workspace:GetChildren()) do
-                    if
-                        v:IsA("BackpackItem") and
-                        v:FindFirstChild("Handle") and
-                        v.Name ~= "leech" and
-                        v.Name ~= "Broom"
-                    then
+                    if v:IsA("BackpackItem") and v:FindFirstChild("Handle") and v.Name ~= "leech" and v.Name ~= "Broom" then
                         TeleportTo(CFrame.new(v.Handle.Position) + Vector3.new(0, 2, 0))
                         task.wait(0.05)
                         char.Humanoid:EquipTool(v)
@@ -368,6 +789,10 @@ Tab1:CreateButton({
     end
 })
 
+-- =====================
+--     FINANCE TAB
+-- =====================
+
 local Tab2 = Window:CreateTab("Finance", "coins")
 
 Tab2:CreateSection("Auto Craft")
@@ -383,47 +808,34 @@ Tab2:CreateButton({
         local char = GetChar()
         local hrp = GetHRP()
         if not char or not hrp then return end
-
         if char.shillings.Value < 8 then
             Rayfield:Notify({ Title = "Buy", Content = "Not enough shillings! You need 8.", Duration = 4, Image = "alert-circle" })
             return
         end
-
-        local promptPart = SafeGet(function()
-            return Workspace.buyprompts.items["economy shop"].buypromptD
-        end)
+        local promptPart = SafeGet(function() return Workspace.buyprompts.items["economy shop"].buypromptD end)
         if not promptPart then
-            Rayfield:Notify({ Title = "Buy", Content = "buypromptD not found in buyprompts/items/economy shop.", Duration = 3, Image = "alert-circle" })
+            Rayfield:Notify({ Title = "Buy", Content = "buypromptD not found.", Duration = 3, Image = "alert-circle" })
             return
         end
-
         local prompt = promptPart:FindFirstChildWhichIsA("ProximityPrompt")
         if not prompt then
-            Rayfield:Notify({ Title = "Buy", Content = "ProximityPrompt not found on buypromptD.", Duration = 3, Image = "alert-circle" })
+            Rayfield:Notify({ Title = "Buy", Content = "ProximityPrompt not found.", Duration = 3, Image = "alert-circle" })
             return
         end
-
-        Rayfield:Notify({ Title = "Buy", Content = "Buying with 8 shillings...", Duration = 3, Image = "shopping-cart" })
-
         local origin = hrp.CFrame
         TeleportTo(CFrame.new(promptPart.Position) + Vector3.new(0, 3, 0))
         task.wait(0.2)
-
         local timeout = 0
         repeat
             task.wait(0.1)
             timeout += 0.1
             pcall(function() fireproximityprompt(prompt) end)
-        until char.shillings.Value <= 0
-            or (hrp.Position - promptPart.Position).Magnitude > 25
-            or timeout > 30
-
+        until char.shillings.Value <= 0 or timeout > 30
         TeleportTo(origin)
         Rayfield:Notify({ Title = "Buy", Content = "Done buying.", Duration = 3, Image = "shopping-cart" })
     end
 })
 
--- WAVE CRAFTING SYSTEM - ONLY equips unfinished flintlocks
 Tab2:CreateButton({
     Name = "Craft (Wave System)",
     Callback = function()
@@ -431,103 +843,54 @@ Tab2:CreateButton({
         local hrp = GetHRP()
         if not char or not hrp then return end
         local origin = hrp.CFrame
-
-        -- ONLY move unfinished flintlocks from backpack to character
         for _, v in pairs(LocalPlayer.Backpack:GetChildren()) do
             if v:IsA("Tool") and Find(v.Name, {"unfin", "unfinished"}) then
                 v.Parent = char
             end
         end
-
-        -- Check if we have any unfinished flintlocks
         local unfinishedItems = GetUnfinishedFlintlocks()
         if #unfinishedItems == 0 then
             Rayfield:Notify({ Title = "Craft", Content = "No unfinished flintlocks found.", Duration = 3, Image = "alert-circle" })
             return
         end
-
-        Rayfield:Notify({ Title = "Craft", Content = "Found " .. #unfinishedItems .. " unfinished flintlocks to craft.", Duration = 3, Image = "hammer" })
-
-        -- Get all workbenches
         local _, partA = GetWorkbench("WorkbenchA")
         local _, partB = GetWorkbench("WorkbenchB")
         local _, partC = GetWorkbench("WorkbenchC")
         local _, partD = GetWorkbench("WorkbenchD")
-
         local benches = {}
         if partA then table.insert(benches, partA) end
         if partB then table.insert(benches, partB) end
         if partC then table.insert(benches, partC) end
         if partD then table.insert(benches, partD) end
-
         if #benches == 0 then
-            Rayfield:Notify({ Title = "Craft", Content = "No workbench found in Workspace.workbenches.", Duration = 3, Image = "alert-circle" })
+            Rayfield:Notify({ Title = "Craft", Content = "No workbench found.", Duration = 3, Image = "alert-circle" })
             TeleportTo(origin)
             return
         end
-
-        local craftCount = 0
-        local maxAttempts = 30
-        local giveUp = false
-
-        while #GetUnfinishedFlintlocks() > 0 and not giveUp do
+        local craftCount, maxAttempts = 0, 30
+        while #GetUnfinishedFlintlocks() > 0 and craftCount < maxAttempts do
             craftCount += 1
-            if craftCount > maxAttempts then
-                giveUp = true
-                break
-            end
-
-            Rayfield:Notify({ Title = "Craft", Content = "Crafting cycle " .. craftCount .. "...", Duration = 2, Image = "hammer" })
-
-            -- For each workbench
-            for benchIndex, bench in ipairs(benches) do
+            for _, bench in ipairs(benches) do
                 local currentUnfinished = GetUnfinishedFlintlocks()
                 if #currentUnfinished == 0 then break end
-
-                -- Teleport to the workbench
                 TeleportTo(CFrame.new(bench.Position) + Vector3.new(0, 3, 0))
                 task.wait(0.4)
-
-                Rayfield:Notify({ 
-                    Title = "Wave System", 
-                    Content = "Using Workbench " .. benchIndex .. " with " .. #currentUnfinished .. " flintlocks", 
-                    Duration = 2, 
-                    Image = "zap" 
-                })
-
-                -- Touch EACH unfinished flintlock to the workbench ONE BY ONE
-                for itemIndex, item in ipairs(currentUnfinished) do
+                for _, item in ipairs(currentUnfinished) do
                     if not item or not item.Parent then continue end
-                    
                     pcall(function()
-                        -- ONLY equip the unfinished flintlock
                         char.Humanoid:EquipTool(item)
                         task.wait(0.15)
-                        
-                        -- Touch the workbench with the flintlock
                         firetouchinterest(bench, item.Handle, 0)
                         task.wait(0.1)
                         firetouchinterest(bench, item.Handle, 1)
-                        
-                        Rayfield:Notify({ 
-                            Title = "Crafting", 
-                            Content = "Flintlock " .. itemIndex .. "/" .. #currentUnfinished .. " on bench " .. benchIndex, 
-                            Duration = 1, 
-                            Image = "hammer" 
-                        })
                     end)
-                    
                     task.wait(0.2)
                 end
-                
                 task.wait(0.5)
             end
-            
             task.wait(0.3)
         end
-
         TeleportTo(origin)
-
         local remaining = GetUnfinishedFlintlocks()
         if #remaining > 0 then
             Rayfield:Notify({ Title = "Craft", Content = #remaining .. " flintlocks remain uncrafted.", Duration = 5, Image = "alert-circle" })
@@ -544,61 +907,58 @@ Tab2:CreateButton({
         local hrp = GetHRP()
         if not char or not hrp then return end
         local origin = hrp.CFrame
-
         local sellPart = nil
         for _, v in pairs(Workspace:GetDescendants()) do
-            if v.Name == "sellweapon" and v:IsA("BasePart") and v.Rotation == Vector3.new(0, 0, 0) then
-                sellPart = v
-                break
-            end
+            if v.Name == "sellweapon" and v:IsA("BasePart") then sellPart = v break end
         end
-
         if not sellPart then
             Rayfield:Notify({ Title = "Sell", Content = "Sell pad not found.", Duration = 3, Image = "alert-circle" })
             return
         end
-
         local sellPrompt = sellPart:FindFirstChildWhichIsA("ProximityPrompt")
         if not sellPrompt then
-            Rayfield:Notify({ Title = "Sell", Content = "Sell prompt not found on pad.", Duration = 3, Image = "alert-circle" })
+            Rayfield:Notify({ Title = "Sell", Content = "Sell prompt not found.", Duration = 3, Image = "alert-circle" })
             return
         end
-
-        -- Only move finished flintlocks to character for selling
-        for _, v in pairs(LocalPlayer.Backpack:GetChildren()) do
-            if v:IsA("Tool") and Find(v.Name, {"flintlock", "flint", "shortsword"}) and not Find(v.Name, {"unfin", "unfinished", "ammo"}) then
-                v.Parent = char
+        local sellableWeapons = {}
+        for _, src in pairs({char, LocalPlayer.Backpack}) do
+            for _, v in pairs(src:GetChildren()) do
+                if v:IsA("Tool") and v:FindFirstChild("Handle") then
+                    local name = v.Name:lower()
+                    if (name:find("flintlock") or name:find("flint") or name:find("shortsword"))
+                        and not name:find("unfin") and not name:find("unfinished") then
+                        table.insert(sellableWeapons, v)
+                    end
+                end
             end
         end
-
+        if #sellableWeapons == 0 then
+            Rayfield:Notify({ Title = "Sell", Content = "No sellable weapons found!", Duration = 3, Image = "alert-circle" })
+            return
+        end
+        for _, weapon in ipairs(sellableWeapons) do
+            pcall(function() if weapon.Parent ~= char then weapon.Parent = char end end)
+        end
+        task.wait(0.1)
         TeleportTo(CFrame.new(sellPart.Position) + Vector3.new(0, 3, 0))
         task.wait(0.3)
-
-        for _, v in pairs(char:GetChildren()) do
-            if v:IsA("Tool") and Find(v.Name, {"flintlock", "flint", "shortsword"}) and not Find(v.Name, {"unfin", "unfinished", "ammo"}) and v:FindFirstChild("Handle") then
+        for _, weapon in ipairs(sellableWeapons) do
+            if weapon and weapon.Parent == char and weapon:FindFirstChild("Handle") then
                 pcall(function()
-                    firetouchinterest(sellPart, v.Handle, 0)
-                    task.wait(0.05)
-                    firetouchinterest(sellPart, v.Handle, 1)
+                    char.Humanoid:EquipTool(weapon)
+                    task.wait(0.1)
+                    firetouchinterest(sellPart, weapon.Handle, 0)
+                    task.wait(0.1)
+                    firetouchinterest(sellPart, weapon.Handle, 1)
+                    task.wait(0.1)
+                    fireproximityprompt(sellPrompt)
                 end)
-                task.wait(0.05)
+                task.wait(0.2)
             end
         end
-
-        local timeout = 0
-        repeat
-            task.wait(0.1)
-            timeout += 0.1
-            pcall(function() fireproximityprompt(sellPrompt) end)
-            pcall(function()
-                firetouchinterest(sellPart, hrp, 0)
-                firetouchinterest(sellPart, hrp, 1)
-            end)
-        until timeout > 5
-
-        task.wait(0.1)
+        task.wait(0.2)
         TeleportTo(origin)
-        Rayfield:Notify({ Title = "Sell", Content = "Done selling.", Duration = 3, Image = "banknote" })
+        Rayfield:Notify({ Title = "Sell", Content = "Sold " .. #sellableWeapons .. " weapons!", Duration = 3, Image = "banknote" })
     end
 })
 
@@ -608,29 +968,22 @@ Tab2:CreateButton({
     Name = "Buy 1 Doc Bag (2 shill)",
     Callback = function()
         local char = GetChar()
-        local hrp = GetHRP()
-        if not char or not hrp then return end
+        if not char then return end
         if char.shillings.Value < 2 then
-            Rayfield:Notify({ Title = "Fast Buy", Content = "Not enough shillings! You need 2.", Duration = 3, Image = "alert-circle" })
+            Rayfield:Notify({ Title = "Fast Buy", Content = "Not enough shillings!", Duration = 3, Image = "alert-circle" })
             return
         end
-        local promptPart = SafeGet(function()
-            return Workspace.buyprompts.items.mix["hospital shop"].buypromptbag
-        end)
+        local promptPart = SafeGet(function() return Workspace.buyprompts.items.mix["hospital shop"].buypromptbag end)
         if not promptPart then
-            Rayfield:Notify({ Title = "Fast Buy", Content = "Hospital shop buypromptbag not found.", Duration = 3, Image = "alert-circle" })
+            Rayfield:Notify({ Title = "Fast Buy", Content = "Hospital shop not found.", Duration = 3, Image = "alert-circle" })
             return
         end
         local prompt = promptPart:FindFirstChildWhichIsA("ProximityPrompt")
         if not prompt then
-            Rayfield:Notify({ Title = "Fast Buy", Content = "ProximityPrompt not found.", Duration = 3, Image = "alert-circle" })
+            Rayfield:Notify({ Title = "Fast Buy", Content = "Prompt not found.", Duration = 3, Image = "alert-circle" })
             return
         end
-        TeleportDoReturn(
-            CFrame.new(promptPart.Position) + Vector3.new(0, 3, 0),
-            function() pcall(function() fireproximityprompt(prompt) end) end,
-            0.3
-        )
+        TeleportDoReturn(CFrame.new(promptPart.Position) + Vector3.new(0, 3, 0), function() pcall(function() fireproximityprompt(prompt) end) end, 0.3)
     end
 })
 
@@ -638,29 +991,22 @@ Tab2:CreateButton({
     Name = "Buy 1 Knife (5 pence)",
     Callback = function()
         local char = GetChar()
-        local hrp = GetHRP()
-        if not char or not hrp then return end
+        if not char then return end
         if char.pence.Value < 5 then
-            Rayfield:Notify({ Title = "Fast Buy", Content = "Not enough pence! You need 5.", Duration = 3, Image = "alert-circle" })
+            Rayfield:Notify({ Title = "Fast Buy", Content = "Not enough pence!", Duration = 3, Image = "alert-circle" })
             return
         end
-        local promptPart = SafeGet(function()
-            return Workspace.buyprompts.items["melee shop"].buypromptA
-        end)
+        local promptPart = SafeGet(function() return Workspace.buyprompts.items["melee shop"].buypromptA end)
         if not promptPart then
-            Rayfield:Notify({ Title = "Fast Buy", Content = "Melee shop buypromptA not found.", Duration = 3, Image = "alert-circle" })
+            Rayfield:Notify({ Title = "Fast Buy", Content = "Melee shop not found.", Duration = 3, Image = "alert-circle" })
             return
         end
         local prompt = promptPart:FindFirstChildWhichIsA("ProximityPrompt")
         if not prompt then
-            Rayfield:Notify({ Title = "Fast Buy", Content = "ProximityPrompt not found.", Duration = 3, Image = "alert-circle" })
+            Rayfield:Notify({ Title = "Fast Buy", Content = "Prompt not found.", Duration = 3, Image = "alert-circle" })
             return
         end
-        TeleportDoReturn(
-            CFrame.new(promptPart.Position) + Vector3.new(0, 3, 0),
-            function() pcall(function() fireproximityprompt(prompt) end) end,
-            0.3
-        )
+        TeleportDoReturn(CFrame.new(promptPart.Position) + Vector3.new(0, 3, 0), function() pcall(function() fireproximityprompt(prompt) end) end, 0.3)
     end
 })
 
@@ -668,35 +1014,31 @@ Tab2:CreateButton({
     Name = "Buy 1 Torch (5 pence)",
     Callback = function()
         local char = GetChar()
-        local hrp = GetHRP()
-        if not char or not hrp then return end
+        if not char then return end
         if char.pence.Value < 5 then
-            Rayfield:Notify({ Title = "Fast Buy", Content = "Not enough pence! You need 5.", Duration = 3, Image = "alert-circle" })
+            Rayfield:Notify({ Title = "Fast Buy", Content = "Not enough pence!", Duration = 3, Image = "alert-circle" })
             return
         end
         local promptPart = nil
         for _, v in pairs(Workspace:GetDescendants()) do
-            if v.Name == "buypromptI" and v:IsA("BasePart") then
-                promptPart = v
-                break
-            end
+            if v.Name == "buypromptI" and v:IsA("BasePart") then promptPart = v break end
         end
         if not promptPart then
-            Rayfield:Notify({ Title = "Fast Buy", Content = "buypromptI not found in workspace.", Duration = 3, Image = "alert-circle" })
+            Rayfield:Notify({ Title = "Fast Buy", Content = "buypromptI not found.", Duration = 3, Image = "alert-circle" })
             return
         end
         local prompt = promptPart:FindFirstChildWhichIsA("ProximityPrompt")
         if not prompt then
-            Rayfield:Notify({ Title = "Fast Buy", Content = "ProximityPrompt not found.", Duration = 3, Image = "alert-circle" })
+            Rayfield:Notify({ Title = "Fast Buy", Content = "Prompt not found.", Duration = 3, Image = "alert-circle" })
             return
         end
-        TeleportDoReturn(
-            CFrame.new(promptPart.Position) + Vector3.new(0, 3, 0),
-            function() pcall(function() fireproximityprompt(prompt) end) end,
-            0.3
-        )
+        TeleportDoReturn(CFrame.new(promptPart.Position) + Vector3.new(0, 3, 0), function() pcall(function() fireproximityprompt(prompt) end) end, 0.3)
     end
 })
+
+-- =====================
+--       MISC TAB
+-- =====================
 
 local Tab3 = Window:CreateTab("Misc", "wrench")
 
@@ -710,18 +1052,6 @@ Tab3:CreateButton({
         local calc = char:FindFirstChild("healthcalculator")
         if calc and calc:FindFirstChild("armor") then
             calc.armor:Destroy()
-            char.pounds.Changed:Connect(function(new)
-                LocalPlayer.PlayerGui.money.pounds.Text = new .. " Pounds"
-            end)
-            char.pence.Changed:Connect(function(new)
-                LocalPlayer.PlayerGui.money.pence.Text = new .. " Pence"
-            end)
-            char.shillings.Changed:Connect(function(new)
-                LocalPlayer.PlayerGui.money.shillings.Text = new .. " Shillings"
-            end)
-            char.farthings.Changed:Connect(function(new)
-                LocalPlayer.PlayerGui.money.farthings.Text = new .. " Farthings"
-            end)
             Rayfield:Notify({ Title = "Water Immunity", Content = "Immune to water/leeches until respawn.", Duration = 4, Image = "shield" })
         else
             Rayfield:Notify({ Title = "Water Immunity", Content = "Already immune or armor not found.", Duration = 3, Image = "alert-circle" })
@@ -764,6 +1094,10 @@ Tab3:CreateButton({
     end
 })
 
+-- =====================
+--       NUKE TAB
+-- =====================
+
 local Tab4 = Window:CreateTab("NUKE", "bomb")
 
 Tab4:CreateSection("Nuke the server")
@@ -783,58 +1117,44 @@ Tab4:CreateButton({
             Rayfield:Notify({ Title = "Nuke", Content = "Not enough shillings (need 5+).", Duration = 3, Image = "alert-circle" })
             return
         end
-
         local promptPart = nil
         local meleeShop = SafeGet(function() return Workspace.buyprompts.items["melee shop"] end)
         if meleeShop then
             for _, v in pairs(meleeShop:GetChildren()) do
-                if v.Name == "buypromptF" and v:IsA("BasePart") then
-                    promptPart = v
-                    break
-                end
+                if v.Name == "buypromptF" and v:IsA("BasePart") then promptPart = v break end
             end
         end
-        
         if not promptPart then
             for _, v in pairs(Workspace:GetDescendants()) do
-                if v.Name == "buypromptF" and v:IsA("BasePart") then
-                    promptPart = v
-                    break
-                end
+                if v.Name == "buypromptF" and v:IsA("BasePart") then promptPart = v break end
             end
         end
-
         if not promptPart then
-            Rayfield:Notify({ Title = "Nuke", Content = "Grenade prompt (buypromptF) not found.", Duration = 3, Image = "alert-circle" })
+            Rayfield:Notify({ Title = "Nuke", Content = "Grenade prompt not found.", Duration = 3, Image = "alert-circle" })
             return
         end
-
         local prompt = promptPart:FindFirstChildWhichIsA("ProximityPrompt")
         if not prompt then
-            Rayfield:Notify({ Title = "Nuke", Content = "ProximityPrompt not found on buypromptF.", Duration = 3, Image = "alert-circle" })
+            Rayfield:Notify({ Title = "Nuke", Content = "ProximityPrompt not found.", Duration = 3, Image = "alert-circle" })
             return
         end
-
         local origin = hrp.CFrame
         TeleportTo(CFrame.new(promptPart.Position) + Vector3.new(0, 3, 0))
         task.wait(0.2)
-
-        local timeout = 0
         local initialShillings = char.shillings.Value
         repeat
             task.wait(0.1)
-            timeout += 0.1
             pcall(function() fireproximityprompt(prompt) end)
             task.wait(0.05)
         until char.shillings.Value < 5
-            or (hrp.Position - promptPart.Position).Magnitude > 25
-            or timeout > 60
-
         TeleportTo(origin)
-        local spent = initialShillings - char.shillings.Value
-        Rayfield:Notify({ Title = "Nuke", Content = "Spent " .. spent .. " shillings on grenades!", Duration = 4, Image = "bomb" })
+        Rayfield:Notify({ Title = "Nuke", Content = "Spent " .. (initialShillings - char.shillings.Value) .. " shillings on grenades!", Duration = 4, Image = "bomb" })
     end
 })
+
+-- =====================
+--      SCRIPTS TAB
+-- =====================
 
 local Tab5 = Window:CreateTab("Scripts", "terminal")
 
@@ -881,19 +1201,28 @@ Tab5:CreateButton({
     end
 })
 
+-- =====================
+--      CREDITS TAB
+-- =====================
+
 local Tab6 = Window:CreateTab("Credits", "info")
 
 Tab6:CreateSection("Info")
 
-Tab6:CreateParagraph({ Title = "Made by", Content = "Your Typical Exploiter" })
+Tab6:CreateParagraph({ Title = "Made by",       Content = "Your Typical Exploiter" })
 Tab6:CreateParagraph({ Title = "Original idea", Content = "Dave" })
-Tab6:CreateParagraph({ Title = "Toggle UI", Content = "Press K to show/hide." })
-Tab6:CreateParagraph({ Title = "F Key Attack", Content = "Press F to EQUIP and ATTACK with ALL tools at once!" })
-Tab6:CreateParagraph({ Title = "Wave Crafting", Content = "Only equips unfinished flintlocks one by one!" })
+Tab6:CreateParagraph({ Title = "Toggle UI",     Content = "Press K to show/hide." })
+Tab6:CreateParagraph({ Title = "F Key Attack",  Content = "Press F to equip and attack with all tools at once!" })
+Tab6:CreateParagraph({ Title = "X Key Aimbot",  Content = "Press X to toggle aimbot on/off!" })
+Tab6:CreateParagraph({ Title = "Kill Aura",     Content = "Targets nearest player until death!" })
+Tab6:CreateParagraph({ Title = "Hitbox Extender", Content = "Expands player hitboxes up to size 100. Resets on disable." })
 
 Tab6:CreateButton({
     Name = "Destroy GUI",
     Callback = function()
+        DisableHitboxExtender()
+        DisableAimbot()
+        DisableKillAura()
         Rayfield:Destroy()
     end
 })
@@ -907,7 +1236,7 @@ Tab6:CreateButton({
 
 Rayfield:Notify({
     Title = "Fusion (Hub)",
-    Content = "Loaded! Press F to equip and attack with ALL tools at once!",
+    Content = "Loaded! F = all tools | X = aimbot | Hitbox up to size 100",
     Duration = 5,
     Image = "check-circle",
 })
